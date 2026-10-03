@@ -9,9 +9,12 @@ thicker than a printable design would use so they show at this resolution.
 
 Layout (mm, origin at centre of cylinder base):
     Cylinder: radius R, from z = 0 to z = HB, top edge rounded.
-    Legs at 45, 135, 225, 315 deg, LEG_H = 40 mm long (z = -40 to 0).
-    Each leg is a slow trumpet taper out of the cylinder underside that
-    ends in a 3/8"-18 NPT MALE threaded tip (ASME B1.20.1 basic sizes).
+    A deep groin-vault arch (two crossing elliptical arches, apex at
+    z = Z_APEX inside the body) is cut through the lower cylinder, leaving
+    four pillars at 45, 135, 225, 315 deg. The pillars continue the
+    cylinder wall and taper slowly down to a shoulder at z = -SKIRT, then a
+    3/8"-18 NPT MALE threaded tip ends at z = -LEG_H (ASME B1.20.1 basic).
+    Headers sit inside the pillars and follow the arch surface.
     HOT  legs: 45 and 225 deg (in / out)   COLD legs: 135 and 315 deg.
     Bottom header split into four quadrant plenums, one per leg.
     Gyroid core above the headers; a seal slab lets each fluid's
@@ -28,12 +31,17 @@ from skimage.measure import marching_cubes
 
 R, HB, R_TOP = 70.0, 90.0, 10.0       # cylinder radius, height, top rounding
 SHELL = 2.0
-LEG_H = 40.0                          # leg length below the cylinder
-R_BASE = 22.0                         # leg radius where it leaves the body
-R_NECK = 11.0                         # leg radius just above the thread
-LEG_POS = R - R_BASE                  # leg base flush with the outer wall
-BLEND = 15.0                          # extra fillet at the leg/body joint
+LEG_H = 40.0                          # tip depth below the body datum z = 0
+SKIRT = 28.0                          # pillar shoulder depth (thread below it)
+R_NECK = 11.0                         # pillar radius at the shoulder
+LEG_POS = 48.0                        # radius of the leg axes
+Z_APEX = 20.0                         # arch apex, cut up into the body
+ARCH_A = 23.5                         # arch half-width at the base
+Z_ARCH0 = -40.0                       # ellipse base (below the tips: no
+                                      # vertical arch walls, slow blend)
+K_ARCH = 6.0                          # fillet where arch meets wall/pillar
 BORE_R = 5.0                          # 10 mm flow bore
+ZP_LOW = -20.0                        # headers reach down into the pillars
 
 # 3/8"-18 NPT external thread (ASME B1.20.1 basic values)
 IN = 25.4
@@ -42,7 +50,7 @@ NPT_E0 = 0.61201 * IN                 # 15.545 mm pitch dia at the tip
 NPT_H = 0.8 * NPT_P                   # truncated thread height
 NPT_TAPER = 1.0 / 16.0                # on diameter
 THREAD_L = 12.0                       # threaded length (L2 = 10.2 mm)
-ZP = 14.0                             # header (plenum) height
+ZP = 30.0                             # core starts here (above the arch)
 DV = 2.0                              # divider between quadrant plenums
 S_SEAL = 1.5
 CELL = 12.0
@@ -56,13 +64,14 @@ def smin(a, b, k):
 
 
 def cylinder(x, y, z):
-    """Vertical cylinder with rounded top edge (sharp bottom, legs blend there)."""
+    """Vertical cylinder, rounded top edge, flat bottom at z = -SKIRT."""
     r = np.hypot(x, y)
-    zc = z - HB / 2
-    qx, qz = r - (R - R_TOP), np.abs(zc) - (HB / 2 - R_TOP)
+    hh = (HB + SKIRT) / 2                 # half height, z = -SKIRT .. HB
+    zc = z - (HB - SKIRT) / 2
+    qx, qz = r - (R - R_TOP), np.abs(zc) - (hh - R_TOP)
     top = np.hypot(np.maximum(qx, 0), np.maximum(qz, 0)) \
         + np.minimum(np.maximum(qx, qz), 0) - R_TOP
-    return np.maximum(top, np.maximum(r - R, -z))
+    return top
 
 
 def leg_xy(a):
@@ -70,31 +79,48 @@ def leg_xy(a):
     return LEG_POS * np.cos(t), LEG_POS * np.sin(t)
 
 
-def leg(x, y, z, a):
-    """Tapered leg: trumpet flare from R_BASE at the body to R_NECK at the
-    thread shoulder, then a 3/8-18 NPT male thread down to the tip."""
+def smax(a, b, k):
+    return -smin(-a, -b, k)
+
+
+def arches(x, y, z):
+    """Groin vault: union of two elliptical tunnels along x and along y.
+    Value < 0 inside the cut."""
+    hz = Z_APEX - Z_ARCH0
+    e = lambda w: np.sqrt((w / ARCH_A) ** 2 + ((z - Z_ARCH0) / hz) ** 2) - 1
+    scale = min(ARCH_A, hz)               # rough distance scaling
+    return np.minimum(e(y), e(x)) * scale
+
+
+def taper(x, y, z):
+    """Envelope that narrows each pillar to R_NECK at the shoulder:
+    radius grows as a parabola going up, so the pillar flares slowly
+    into the cylinder wall."""
+    u = np.clip((z + SKIRT) / (SKIRT + 10.0), 0, None)
+    r_env = R_NECK + 55.0 * u ** 2
+    d = []
+    for a, _ in LEGS:
+        lx, ly = leg_xy(a)
+        d.append((np.hypot(x - lx, y - ly) - r_env) / np.sqrt(1 + (110 * u / 38) ** 2))
+    return np.minimum.reduce(d)
+
+
+def npt_tip(x, y, z, a):
+    """3/8-18 NPT male thread from the shoulder (z = -SKIRT) to the tip,
+    right-handed about the outward (-z) axis."""
     lx, ly = leg_xy(a)
     dx, dy = x - lx, y - ly
-    rho, t = np.hypot(dx, dy), -z                  # t = depth below body
-    t1 = LEG_H - THREAD_L                          # end of the flare
-    u = np.clip(t / t1, 0, 1)
-    r_prof = R_NECK + (R_BASE - R_NECK) * (1 - u) ** 2
-    slope = 2 * (R_BASE - R_NECK) * (1 - u) / t1
-    flare = (rho - r_prof) / np.sqrt(1 + slope ** 2)
-    flare = np.maximum(flare, np.maximum(z - 1.0, t - t1))
-
-    # NPT thread, right-handed about the outward (-z) axis
-    s_tip = LEG_H - t                              # distance from the tip
+    rho, t = np.hypot(dx, dy), -z
+    s_tip = LEG_H - t
     th = np.arctan2(dx, dy)
     rp = (NPT_E0 + np.maximum(s_tip, 0) * NPT_TAPER) / 2
     w = np.mod(t - NPT_P * th / (2 * np.pi), NPT_P) - NPT_P / 2
     r_thr = rp + np.tan(np.radians(60)) * (NPT_P / 4 - np.abs(w))
     r_thr = np.clip(r_thr, rp - NPT_H / 2, rp + NPT_H / 2)
     thr = 0.5 * (rho - r_thr)
-    thr = np.maximum(thr, -s_tip)                  # cut at the tip
-    thr = np.maximum(thr, (rho - rp) - (s_tip - 0.8))   # tip chamfer
-    thr = np.maximum(thr, s_tip - (THREAD_L + 1.0))     # runs into shoulder
-    return np.minimum(flare, thr)
+    thr = np.maximum(thr, -s_tip)
+    thr = np.maximum(thr, (rho - rp) - (s_tip - 0.8))
+    return np.maximum(thr, s_tip - (LEG_H - SKIRT + 1.0))
 
 
 def sector(x, y, a):
@@ -112,12 +138,10 @@ def gyroid(x, y, z):
 
 
 def fields(x, y, z):
-    outer = cylinder(x, y, z)
+    outer = smax(cylinder(x, y, z), -arches(x, y, z), K_ARCH)
+    outer = smax(outer, taper(x, y, z), K_ARCH)
     for a, _ in LEGS:
-        outer = smin(outer, leg(x, y, z, a), BLEND)
-    # trim the blend to the cylinder wall: legs stay flush, the blend only
-    # forms the arches underneath instead of bulging outwards
-    outer = np.maximum(outer, np.hypot(x, y) - R)
+        outer = np.minimum(outer, npt_tip(x, y, z, a))
     inner = outer + SHELL
 
     G = gyroid(x, y, z)
@@ -130,9 +154,9 @@ def fields(x, y, z):
 
     for a, f in LEGS:
         lx, ly = leg_xy(a)
-        plen = np.maximum(np.maximum(SHELL - z, z - (ZP + 0.5)),
+        plen = np.maximum(np.maximum(ZP_LOW - z, z - (ZP + 0.5)),
                           np.maximum(inner, sector(x, y, a)))
-        bore = np.maximum(np.hypot(x - lx, y - ly) - BORE_R, z - (SHELL + 1.0))
+        bore = np.maximum(np.hypot(x - lx, y - ly) - BORE_R, z - (ZP_LOW + 1.0))
         v = np.minimum(plen, bore)
         if f == "hot":
             hot = np.minimum(hot, v)
@@ -194,10 +218,10 @@ def main():
     lx, ly = leg_xy(45)
     fs = 0.15
     gx = np.arange(lx - 26, lx + 26, fs); gy = np.arange(ly - 26, ly + 26, fs)
-    gz = np.arange(-41.5, 2, fs)
+    gz = np.arange(-41.5, 24, fs)
     Xl, Yl, Zl = np.meshgrid(gx, gy, gz, indexing="ij")
     ol, _, _, _ = fields(Xl, Yl, Zl)
-    ol = np.maximum(ol, Zl - 0.5)                  # leg only, below the body
+    ol = np.maximum(ol, Zl - 22.0)                 # pillar only, up to the arch apex
     ol = np.maximum(ol, np.hypot(Xl - lx, Yl - ly) - 25)
     del Xl, Yl, Zl
     v, f = mesh(ol, fs, np.array([gx[0], gy[0], gz[0]]))
@@ -205,11 +229,11 @@ def main():
     fig = plt.figure(figsize=(13, 6), dpi=110)
     ax = fig.add_subplot(1, 2, 1, projection="3d")
     ax.add_collection3d(Poly3DCollection(tri, facecolors=col, edgecolor="none"))
-    ax.set_xlim(lx - 26, lx + 26); ax.set_ylim(ly - 26, ly + 26); ax.set_zlim(-42, 2)
-    ax.set_box_aspect((52, 52, 44)); ax.view_init(-12, -60); ax.set_axis_off()
-    ax.set_title("Leg: slow taper from the body to a 3/8\"-18 NPT male tip", fontsize=11)
+    ax.set_xlim(lx - 26, lx + 26); ax.set_ylim(ly - 26, ly + 26); ax.set_zlim(-42, 24)
+    ax.set_box_aspect((52, 52, 66)); ax.view_init(-12, -60); ax.set_axis_off()
+    ax.set_title("Pillar: arch-blended taper to a 3/8\"-18 NPT male tip", fontsize=11)
     ax = fig.add_subplot(1, 2, 2)
-    q = np.arange(-28, 28, 0.08); qz = np.arange(-42, 18, 0.08)
+    q = np.arange(-30, 30, 0.08); qz = np.arange(-42, 40, 0.08)
     Q, QZ = np.meshgrid(q, qz, indexing="ij")
     tt = np.radians(45)
     _, s2, h2, c2 = fields(lx + Q * np.cos(tt), ly + Q * np.sin(tt), QZ)
@@ -229,7 +253,7 @@ def main():
         return m
     g = np.arange(-75, 75.01, 0.25)
     fig, axs = plt.subplots(1, 4, figsize=(20, 5.6), dpi=110)
-    for ax, zc, t in [(axs[0], 8.0, "Header level z = 8 mm\n(4 quadrant plenums)"),
+    for ax, zc, t in [(axs[0], 24.0, "Header level z = 24 mm\n(4 quadrant plenums above the arches)"),
                       (axs[1], 45.0, "Core z = 45 mm\n(interleaved gyroid channels)")]:
         Xs, Ys = np.meshgrid(g, g, indexing="ij")
         _, s, h, c = fields(Xs, Ys, np.full_like(Xs, zc))
